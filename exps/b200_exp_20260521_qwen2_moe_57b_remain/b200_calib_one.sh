@@ -75,7 +75,7 @@ select_cuda_home() {
 }
 
 export HF_HOME=$B200_ROOT/hf_cache
-export MXMOE_B200_CUDA_VERSION="${MXMOE_B200_CUDA_VERSION:-12.8}"
+export MXMOE_B200_CUDA_VERSION="${MXMOE_B200_CUDA_VERSION:-13.1}"
 CUDA_SELECTED="$(select_cuda_home "$MXMOE_B200_CUDA_VERSION")"
 export CUDA_HOME="$CUDA_SELECTED"
 export PATH="$CUDA_HOME/bin:$PATH"
@@ -115,13 +115,11 @@ echo "=== checked out: $CURRENT_SHA ==="
 
 uv run --no-sync python - <<'PY'
 import torch
-import flash_attn
 import fast_hadamard_transform
 print("torch", torch.__version__, "cuda", torch.version.cuda)
-assert torch.__version__.startswith("2.7.1"), torch.__version__
-assert torch.version.cuda == "12.8", torch.version.cuda
+assert torch.__version__.startswith("2.12.0"), torch.__version__
+assert torch.version.cuda and torch.version.cuda.startswith("13."), torch.version.cuda
 print("cuda devices", torch.cuda.device_count())
-print("flash_attn ok", flash_attn.__version__)
 print("fast_hadamard_transform ok")
 PY
 

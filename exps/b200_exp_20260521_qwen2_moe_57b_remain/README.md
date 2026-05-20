@@ -65,21 +65,18 @@ changes live in `pyproject_b200.toml` under this experiment directory only.
 This stages `b200_setup.sh` with sftp, then submits it as a B200 job. It clones
 `https://github.com/badeok0716/MxMoE.git` to `$B200_ROOT/MxMoE`, checks out the
 given SHA, copies this experiment's `pyproject_b200.toml` to the B200 checkout
-as `pyproject.toml`, builds the uv env, installs `flash-attn` and
-`fast-hadamard-transform`, and downloads `Qwen/Qwen2-57B-A14B-Instruct`.
+as `pyproject.toml`, builds the uv env, installs `fast-hadamard-transform`,
+and downloads `Qwen/Qwen2-57B-A14B-Instruct`.
 
-The B200-only pyproject pins PyTorch to `torch==2.7.1` from the cu128 PyTorch index and selects
-a CUDA 12.8 toolkit before building CUDA extensions. This is intentionally
+The B200-only pyproject pins PyTorch to `torch==2.12.0` so it matches the B200
+image's CUDA 13.x toolkit before building CUDA extensions. This is intentionally
 confined to the B200 checkout; the gateway/root environment remains unchanged.
-If CUDA 12.8 is not installed on the B200 image, setup falls back to the first
-available CUDA toolkit and logs the selected `CUDA_HOME`. The setup also patches
+Setup logs the selected `CUDA_HOME`. The setup also patches
 the B200 checkout's `fast-hadamard-transform/setup.py` to build `sm_100` only,
 because CUDA 13.x rejects the upstream hard-coded `sm_70` arch flag.
-Extension packages are installed with `--no-deps` so `flash-attn` or
-`fast-hadamard-transform` cannot upgrade/downgrade torch after `uv sync`.
-The setup also removes stale `flash_attn_2_cuda*.so` files and clears the
-flash-attn uv cache before rebuilding, so an ABI-mismatched cached wheel is not
-reused across retries.
+`flash-attn` is intentionally not installed for this B200 workflow; the runner
+uses PyTorch SDPA attention to avoid CUDA extension ABI drift. Setup removes
+stale `flash_attn_2_cuda*.so` files from earlier retries.
 
 ```bash
 bash exps/b200_exp_20260521_qwen2_moe_57b_remain/gateway_bootstrap.sh "$SHA"

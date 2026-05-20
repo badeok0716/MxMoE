@@ -6,9 +6,9 @@ requires-python = "==3.11.*"
 # B200-only deps. The gateway/root pyproject.toml stays unchanged; b200_setup.sh
 # copies this file to the B200 checkout as pyproject.toml before uv sync.
 dependencies = [
-    # B200/Blackwell needs PyTorch wheels with sm_100 support. Use the PyTorch
-    # cu128 index instead of the repo default torch==2.6.0 PyPI cu124 wheel.
-    "torch==2.7.1",
+    # B200 image exposes CUDA 13.1. Use a B200-only torch wheel new enough to
+    # match CUDA 13.x extension builds; the gateway/root pyproject is unchanged.
+    "torch==2.12.0",
     "transformers==4.52.3",
     "accelerate==1.7.0",
     "datasets==3.6.0",
@@ -34,11 +34,3 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["mxmoe"]
-
-[[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
-explicit = true
-
-[tool.uv.sources]
-torch = { index = "pytorch-cu128" }
