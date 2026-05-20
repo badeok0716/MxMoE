@@ -71,6 +71,10 @@ as `pyproject.toml`, builds the uv env, installs `flash-attn` and
 The B200-only pyproject switches PyTorch to the cu128 PyTorch index and selects
 a CUDA 12.8 toolkit before building CUDA extensions. This is intentionally
 confined to the B200 checkout; the gateway/root environment remains unchanged.
+If CUDA 12.8 is not installed on the B200 image, setup falls back to the first
+available CUDA toolkit and logs the selected `CUDA_HOME`. The setup also patches
+the B200 checkout's `fast-hadamard-transform/setup.py` to build `sm_100` only,
+because CUDA 13.x rejects the upstream hard-coded `sm_70` arch flag.
 
 ```bash
 bash exps/b200_exp_20260521_qwen2_moe_57b_remain/gateway_bootstrap.sh "$SHA"

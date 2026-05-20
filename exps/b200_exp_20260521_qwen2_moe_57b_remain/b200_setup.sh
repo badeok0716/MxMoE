@@ -42,6 +42,8 @@ select_cuda_home() {
 
     local cuda_home
     local nvcc_version
+    local fallback_cuda_home=""
+    local fallback_release=""
     for cuda_home in "${candidates[@]}"; do
         if [[ -x "$cuda_home/bin/nvcc" ]]; then
             nvcc_version="$("$cuda_home/bin/nvcc" --version 2>/dev/null || true)"
@@ -49,20 +51,29 @@ select_cuda_home() {
                 echo "$cuda_home"
                 return 0
             fi
+            if [[ -z "$fallback_cuda_home" ]]; then
+                fallback_cuda_home="$cuda_home"
+                fallback_release="$(sed -n 's/.*release \\([0-9.]*\\),.*/\\1/p' <<<"$nvcc_version" | head -1)"
+            fi
         fi
     done
 
-    echo "ERROR: could not find CUDA toolkit $wanted for B200 torch cu128 builds." >&2
-    echo "Checked candidates:" >&2
-    printf '  %s\n' "${candidates[@]}" >&2
-    echo "Available /usr/local CUDA dirs:" >&2
+    if [[ -n "$fallback_cuda_home" ]]; then
+        echo "WARNING: exact CUDA toolkit $wanted not found; using $fallback_cuda_home release ${fallback_release:-unknown}." >&2
+        echo "$fallback_cuda_home"
+        return 0
+    fi
+
+    echo "ERROR: could not find any CUDA toolkit for B200 torch cu128 builds." >&2
+    printf 'Checked candidate: %s\n' "${candidates[@]}" >&2
     ls -ld /usr/local/cuda* 2>/dev/null >&2 || true
     return 1
 }
 
 export HF_HOME=$B200_ROOT/hf_cache
 export MXMOE_B200_CUDA_VERSION="${MXMOE_B200_CUDA_VERSION:-12.8}"
-export CUDA_HOME="$(select_cuda_home "$MXMOE_B200_CUDA_VERSION")"
+CUDA_SELECTED="$(select_cuda_home "$MXMOE_B200_CUDA_VERSION")"
+export CUDA_HOME="$CUDA_SELECTED"
 export PATH="$CUDA_HOME/bin:$PATH"
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
 export MAX_JOBS="${MAX_JOBS:-16}"
@@ -122,6 +133,29 @@ PY
 uv pip install --force-reinstall flash-attn==2.7.4.post1 --no-build-isolation
 git submodule update --init --recursive mxmoe/3rdparty/fast-hadamard-transform
 rm -rf mxmoe/3rdparty/fast-hadamard-transform/build
+python - <<'PY'
+from pathlib import Path
+
+path = Path("mxmoe/3rdparty/fast-hadamard-transform/setup.py")
+text = path.read_text()
+old = """    cc_flag.append("-gencode")
+    cc_flag.append("arch=compute_70,code=sm_70")
+    cc_flag.append("-gencode")
+    cc_flag.append("arch=compute_80,code=sm_80")
+    if bare_metal_version >= Version("11.8"):
+        cc_flag.append("-gencode")
+        cc_flag.append("arch=compute_90,code=sm_90")
+"""
+new = """    # B200-local build: CUDA 13.x no longer accepts compute_70, and this
+    # experiment only needs Blackwell kernels.
+    cc_flag.append("-gencode")
+    cc_flag.append("arch=compute_100,code=sm_100")
+"""
+if old not in text:
+    raise SystemExit("fast_hadamard_transform setup.py arch block did not match")
+path.write_text(text.replace(old, new))
+print("patched fast_hadamard_transform setup.py for sm_100-only B200 build")
+PY
 uv pip install --force-reinstall -e mxmoe/3rdparty/fast-hadamard-transform --no-build-isolation
 
 uv run python - <<'PY'
