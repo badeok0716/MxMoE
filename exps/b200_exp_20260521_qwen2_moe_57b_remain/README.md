@@ -77,6 +77,9 @@ the B200 checkout's `fast-hadamard-transform/setup.py` to build `sm_100` only,
 because CUDA 13.x rejects the upstream hard-coded `sm_70` arch flag.
 Extension packages are installed with `--no-deps` so `flash-attn` or
 `fast-hadamard-transform` cannot upgrade/downgrade torch after `uv sync`.
+The setup also removes stale `flash_attn_2_cuda*.so` files and clears the
+flash-attn uv cache before rebuilding, so an ABI-mismatched cached wheel is not
+reused across retries.
 
 ```bash
 bash exps/b200_exp_20260521_qwen2_moe_57b_remain/gateway_bootstrap.sh "$SHA"

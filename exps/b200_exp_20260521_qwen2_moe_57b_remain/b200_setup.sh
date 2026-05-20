@@ -134,7 +134,11 @@ assert torch.version.cuda == "12.8", torch.version.cuda
 PY
 
 uv pip uninstall flash-attn fast-hadamard-transform || true
-uv pip install --force-reinstall --no-deps --no-build-isolation --no-binary flash-attn flash-attn==2.7.4.post1
+rm -rf .venv/lib/python3.11/site-packages/flash_attn \
+       .venv/lib/python3.11/site-packages/flash_attn-*.dist-info \
+       .venv/lib/python3.11/site-packages/flash_attn_2_cuda*.so
+uv cache clean flash-attn || true
+uv pip install --no-cache --reinstall --no-deps --no-build-isolation --no-binary :all: flash-attn==2.7.4.post1
 uv run python - <<'PY'
 import torch
 print("torch after flash-attn install", torch.__version__, "cuda", torch.version.cuda)
@@ -142,6 +146,7 @@ assert torch.__version__.startswith("2.7.1"), torch.__version__
 assert torch.version.cuda == "12.8", torch.version.cuda
 PY
 git submodule update --init --recursive mxmoe/3rdparty/fast-hadamard-transform
+git -C mxmoe/3rdparty/fast-hadamard-transform checkout -- setup.py 2>/dev/null || true
 rm -rf mxmoe/3rdparty/fast-hadamard-transform/build
 python - <<'PY'
 from pathlib import Path
@@ -161,12 +166,16 @@ new = """    # B200-local build: CUDA 13.x no longer accepts compute_70, and thi
     cc_flag.append("-gencode")
     cc_flag.append("arch=compute_100,code=sm_100")
 """
-if old not in text:
+if old in text:
+    path.write_text(text.replace(old, new))
+    print("patched fast_hadamard_transform setup.py for sm_100-only B200 build")
+elif "arch=compute_100,code=sm_100" in text and "arch=compute_70,code=sm_70" not in text:
+    print("fast_hadamard_transform setup.py already patched for sm_100-only B200 build")
+else:
     raise SystemExit("fast_hadamard_transform setup.py arch block did not match")
-path.write_text(text.replace(old, new))
-print("patched fast_hadamard_transform setup.py for sm_100-only B200 build")
 PY
-uv pip install --force-reinstall --no-deps -e mxmoe/3rdparty/fast-hadamard-transform --no-build-isolation
+uv cache clean fast-hadamard-transform || true
+uv pip install --no-cache --reinstall --no-deps -e mxmoe/3rdparty/fast-hadamard-transform --no-build-isolation
 uv run python - <<'PY'
 import torch
 print("torch after fast-hadamard install", torch.__version__, "cuda", torch.version.cuda)
