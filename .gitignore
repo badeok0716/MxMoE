@@ -24,3 +24,6 @@ log/*
 calib/*
 calib_bkp/*
 qconfigs/*
+exps/b200_exp_20260521_qwen2_moe_57b_remain/logs/*
+exps/b200_exp_20260521_qwen2_moe_57b_remain/results/*
+exps/b200_exp_20260521_qwen2_moe_57b_remain/diag/*

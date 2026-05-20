@@ -225,6 +225,11 @@ def get_linears_in_one_expert(expert: nn.Module) -> dict[str, nn.Linear]:
 
 
 def get_device_map(model_id: str):
+    # Default to CPU-load (per-layer GPU swap pattern in get_model_quant_error /
+    # parallel_calib). Big-model multi-GPU paths below override this; small
+    # models (qwen2_moe, ds2) keep the CPU default even when N GPUs are visible
+    # so the parallel-calib code can replicate layers itself.
+    device_map = {"": "cpu"}
     if torch.cuda.device_count() == 2:
         if model_id == "qwen2_moe_57b":
             device_map = {
@@ -273,8 +278,15 @@ def get_device_map(model_id: str):
                 "model.norm": "cuda:3",
                 "lm_head": 3,
             }
-    else:
-        device_map = "auto"
+    # Single-GPU / fallback: the `device_map = {"": "cpu"}` set at the top of
+    # this function applies. This forces CPU load so the layer-by-layer GPU swap
+    # pattern in quant.py:get_model_quant_error (and prepare_inps) actually
+    # offloads idle layers to CPU. With "auto" a 30 GB MoE model is loaded
+    # entirely onto a single GPU, which (a) wastes the offload code path and
+    # (b) OOMs on 48 GB ada (and never fits on 24 GB rtx3090).
+    # NB: accelerate's load_checkpoint_and_dispatch does NOT accept "cpu" as a
+    # string device_map (only 'auto/balanced/balanced_low_0/sequential'); use a
+    # dict with the empty-string wildcard to map every submodule to CPU.
 
     return device_map
 
@@ -304,6 +316,13 @@ def load_hf_model(model_id: str, ckpt=None, rotation=False, dtype="auto"):
         fuse_layer_norms(model)
 
     ckpt = ckpt if ckpt is not None else model_name
+    # accelerate.load_checkpoint_and_dispatch only accepts local paths; if ckpt
+    # looks like an HF model ID, resolve it via snapshot_download (cache hit
+    # is instant if the model was already downloaded by from_pretrained).
+    import os
+    if not os.path.exists(ckpt):
+        from huggingface_hub import snapshot_download
+        ckpt = snapshot_download(repo_id=ckpt)
     model = load_checkpoint_and_dispatch(
         model,
         checkpoint=ckpt,

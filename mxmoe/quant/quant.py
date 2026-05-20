@@ -4,6 +4,12 @@ import time
 import torch
 import pickle
 import argparse
+
+# Force FP32 accumulation in BF16 matmul. Disabling reduced-precision reduction
+# makes B=1 vs B=32 forward outputs numerically equivalent (mean diff drops
+# ~200× from 6e-5 → 3e-7; norm diff drops ~23×). Speed cost is negligible
+# (~2% measured in exps/.../tmp_20260520_batch_verify/minimal_bs_diff.py).
+torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
 import warnings
 import torch.nn as nn
 import torch.nn.functional as F
@@ -175,7 +181,9 @@ def prepare_inps(model: PreTrainedModel, dataloader: list[Tensor]):
             cache['i'] += 1
             cache['attention_mask'] = kwargs['attention_mask']
             cache['position_ids'] = kwargs['position_ids']
-            cache['position_embeddings'] = kwargs['position_embeddings']
+            # DS2's custom modeling_deepseek does not pass position_embeddings
+            # to the decoder layer (pre-transformers-4.43 API). Allow missing.
+            cache['position_embeddings'] = kwargs.get('position_embeddings')
             raise ValueError
 
     layers[0] = Catcher(layers[0])
@@ -227,7 +235,7 @@ class MoeModelQuantizer:
     '''
     def __init__(
         self,
-        model:PreTrainedModel, 
+        model:PreTrainedModel,
         model_id: str,
         qmethod:QMethod,
         calib_data_cache:str=None, # calibration data, e.g. channel smoothing factor for SmoothQuant
@@ -236,7 +244,9 @@ class MoeModelQuantizer:
         pre_quantized_weight=None, # pre-quantized weight path, used for time-consuming quantization(GPTQ, GPTQ-HAD)
         ori_wcfg:tuple[int,int]=(16,-1), # original weight bitwidth and group size
         online_had:bool=False,
+        batch_size:int=32, # forward batch size for the per-layer calib loops (smaller for 24GB GPUs)
     ):
+        self.batch_size = batch_size
         self.model_id = model_id
         self.ori_model = model
         self.model_config = model.config
@@ -443,13 +453,29 @@ class MoeModelQuantizer:
                         handle: torch.utils.hooks.RemovableHandle = []
                         handle = m.register_forward_hook(lambda _, inp, out: gptq.add_batch(inp[0].data, out.data))
                         # if self.gptq_attention_mask
+                        # IMPORTANT: do NOT batch this loop. The GPTQ hook
+                        # receives 2D (tokens, hidden_in) input from MoE expert
+                        # linears, which unsqueeze(0)s to (1, ...) → add_batch
+                        # tmp=1 regardless of how many tokens. Batching the outer
+                        # forward call collapses many tokens into one hook call,
+                        # which scales H by ~B (verified Test 1 FAIL: up to 7.8%
+                        # rel_err in layer_loss when this loop was batched).
+                        _pe_kw = {} if self.gptq_pos_emb is None else {'position_embeddings': self.gptq_pos_emb}
+                        # Drift-free Hessian: do NOT overwrite gptq_layer_state here.
+                        # The original code stored cur_layer's output back into
+                        # gptq_layer_state, accumulating drift across every (exp,
+                        # block) iter — so iter k saw inputs = cur_layer^k(orig),
+                        # not the actual layer input as the GPTQ paper assumes.
+                        # State advance (one canonical layer-forward) happens once
+                        # per layer in `get_model_quant_error` after the per-expert
+                        # loop completes.
                         for j in range(self.gptq_nsamples):
-                            self.gptq_layer_state[j] = cur_layer(
+                            cur_layer(
                                 self.gptq_layer_state[j].unsqueeze(0),
                                 attention_mask=self.gptq_attention_mask,
                                 position_ids=self.gptq_position_ids,
-                                position_embeddings=self.gptq_pos_emb,
-                            )[0]
+                                **_pe_kw,
+                            )
                         handle.remove()
                         gptq.fasterquant(
                             percdamp=self.gptq_percdamp, groupsize=cfg.w_gsize, actorder=True, static_groups=True
@@ -523,8 +549,11 @@ class MoeModelQuantizer:
         attn_bits_alloc: QLinearConfig=None,
     ) -> list[list[float]] | list[float]:
         ori_dev = self.ori_model.device
-        if self.model_id in ["qwen2_moe_57b", "mixtral"]: assert ori_dev.type == "cpu"
-        else: assert "cuda" in ori_dev.type
+        # Patched: with get_device_map returning {"": "cpu"} for single-GPU,
+        # small models (qwen2_moe, ds2) now also load on CPU and swap layer-
+        # by-layer to GPU below, matching the big-model (qwen2_moe_57b/mixtral)
+        # offload pattern. Accept either origin device.
+        assert ori_dev.type in ("cpu", "cuda")
 
         assert self.quantized_model is None, "Quantized model should not be initialized"
 
@@ -535,19 +564,44 @@ class MoeModelQuantizer:
         num_samples = len(dataloader)
         input_len = dataloader[0].shape[1]
 
+        num_layers_to_run = min(self.num_layers, getattr(self, "max_layers", None) or self.num_layers)
+
         # allocate for quant error
         layer_loss: list[list[list[float]]] = [[] for _ in range(self.num_layers)]
         layer_loss_save = {}
         
         layers: list[nn.Module] = self.ori_model.model.layers
         if metric == "layer_out_norm":
+            # Online GPTQ/GPTQ-HAD layer-level dispatch.  Each worker owns a
+            # contiguous layer range and replays the full-precision prefix to
+            # obtain the intended per-layer GPTQ activations.  Other methods
+            # fall through to the single-GPU implementation.
+            if (
+                getattr(self, "n_gpus", 1) > 1
+                and self.qmethod in [QMethod.GPTQ, QMethod.GPTQ_HAD]
+                and self.pre_quantized_weight is None
+            ):
+                from mxmoe.quant.layer_parallel_calib import run_layer_parallel_layer_out_norm
+                return run_layer_parallel_layer_out_norm(
+                    self, dataloader, granularity, save_path,
+                    moe_bits_alloc, attn_bits_alloc,
+                )
+            if getattr(self, "n_gpus", 1) > 1:
+                logger.warning(
+                    ">>> --n-gpus > 1 currently accelerates only online GPTQ/GPTQ-HAD "
+                    "without pre-quantized weights; falling back to single-GPU path."
+                )
+
             dev = torch.device("cuda:0")
 
             inps, attn_mask, position_ids, pos_emb = prepare_inps(self.ori_model, dataloader)
-            full_precision_outs: Tensor = torch.zeros_like(inps).to(torch.float64)
-            quantized_outs: Tensor = torch.zeros_like(inps).to(torch.float64)
+            # Buffers stored in BF16 (lossless vs FP64 since layer output is BF16);
+            # diff/norm cast to FP64 in chunks at line ~594. Saves ~13 GB so this
+            # path fits in 48 GB ada GPUs.
+            full_precision_outs: Tensor = torch.zeros_like(inps)
+            quantized_outs: Tensor = torch.zeros_like(inps)
 
-            for layer_idx in tqdm(range(len(layers))):
+            for layer_idx in tqdm(range(num_layers_to_run)):
                 self.ori_model.model.layers[layer_idx] = layers[layer_idx].to(dev)
                 cpu_weights_copy = offload_moe_weights(self.model_id, self.ori_model, layer_idx)
 
@@ -555,13 +609,18 @@ class MoeModelQuantizer:
 
                 with torch.inference_mode():
                     # 1. get the output of the full precision layer
-                    for i in range(num_samples):
-                        full_precision_outs[i] = layer(
-                            inps[i].unsqueeze(0),
+                    # Batched forward (B=32): ~3-4x speedup vs per-sample loop on
+                    # H100/A100 (see exps/.../tmp_20260520_batching_smoke/).
+                    _pe_kw = {} if pos_emb is None else {'position_embeddings': pos_emb}
+                    _B = self.batch_size
+                    for _s in range(0, num_samples, _B):
+                        _e = min(_s + _B, num_samples)
+                        full_precision_outs[_s:_e] = layer(
+                            inps[_s:_e],
                             attention_mask=attn_mask,
                             position_ids=position_ids,
-                            position_embeddings=pos_emb,
-                        )[0].to(torch.float64)
+                            **_pe_kw,
+                        )[0]  # store BF16; FP64 cast happens in chunked norm below
 
                 # 2. get the output of the quantized layer
                 num_layer_experts = len(get_expert_linears(self.ori_model, layer_idx, exclude_non_moe_layer=False))
@@ -577,16 +636,29 @@ class MoeModelQuantizer:
                             else:
                                 self.quant_model_weight_layer(self.ori_model, layer_idx, qlayer_cfg, attn_bits_alloc)
                             self.plug_act_quant_hook_layer(self.ori_model, layer_idx, qlayer_cfg, attn_bits_alloc)
-                            for i in range(num_samples):
-                                quantized_outs[i] = layer(
-                                    inps[i].unsqueeze(0),
+                            _pe_kw = {} if pos_emb is None else {'position_embeddings': pos_emb}
+                            _B = self.batch_size
+                            for _s in range(0, num_samples, _B):
+                                _e = min(_s + _B, num_samples)
+                                quantized_outs[_s:_e] = layer(
+                                    inps[_s:_e],
                                     attention_mask=attn_mask,
                                     position_ids=position_ids,
-                                    position_embeddings=pos_emb,
-                                )[0].to(torch.float64)
+                                    **_pe_kw,
+                                )[0]  # batched store BF16; FP64 cast happens in norm
                             # 3. calculate the quantization error
                             # quant_err = F.mse_loss(quantized_outs, full_precision_outs).item()
-                            quant_err = torch.norm(quantized_outs-full_precision_outs).item()
+                            # Chunked FP64 diff-norm: numerically equivalent to the
+                            # paper's full-buffer FP64 torch.norm (verified bit-identical
+                            # for chunk>=4 in test_chunked_norm_equivalence.py), but
+                            # avoids materializing two 8.6 GB FP64 buffers.
+                            _NORM_CHUNK = 16
+                            _sq = 0.0
+                            for _s in range(0, num_samples, _NORM_CHUNK):
+                                _e = min(_s + _NORM_CHUNK, num_samples)
+                                _d = full_precision_outs[_s:_e].to(torch.float64) - quantized_outs[_s:_e].to(torch.float64)
+                                _sq += _d.pow(2).sum().item()
+                            quant_err = _sq ** 0.5
                             expert_err.append(quant_err)
 
                             # 4. recover the FULL precision layer
@@ -595,6 +667,30 @@ class MoeModelQuantizer:
 
                     layer_loss[layer_idx].append(expert_err)
                     logger.info(f"{self.model_id} L{layer_idx}-E{exp_id} {moe_bits_alloc} (layer_out_norm): {expert_err}")
+
+                # Drift-free GPTQ state advance: now that all (exp, block) iters
+                # for this layer are done and the layer's weights are restored,
+                # push gptq_layer_state through cur_layer ONCE so the next layer's
+                # GPTQ Hessian is taken from this layer's actual outputs.
+                # Only relevant for online GPTQ (no pre-quantized weight); the
+                # `.pt`-loaded GPTQ_HAD path uses substitue_moe_weights and never
+                # populates self.gptq_layer_state.
+                if (
+                    self.qmethod in [QMethod.GPTQ, QMethod.GPTQ_HAD]
+                    and self.pre_quantized_weight is None
+                ):
+                    with torch.inference_mode():
+                        _pe_kw_g = (
+                            {} if self.gptq_pos_emb is None
+                            else {'position_embeddings': self.gptq_pos_emb}
+                        )
+                        for j in range(self.gptq_nsamples):
+                            self.gptq_layer_state[j] = layer(
+                                self.gptq_layer_state[j].unsqueeze(0),
+                                attention_mask=self.gptq_attention_mask,
+                                position_ids=self.gptq_position_ids,
+                                **_pe_kw_g,
+                            )[0]
 
                 del cpu_weights_copy
                 self.ori_model.model.layers[layer_idx] = layers[layer_idx].to(ori_dev)
@@ -608,8 +704,16 @@ class MoeModelQuantizer:
                 logger.info(f"Layer-{layer_idx} quant error(layer_out_norm):\n{layer_loss[layer_idx]}")
 
 
-                # 6. prepare the inputs for next layer
-                inps, full_precision_outs = full_precision_outs.to(inps.dtype), full_precision_outs
+                # 6. prepare the inputs for next layer.
+                # NB: `fp_outs.to(inps.dtype)` was a no-op when both buffers are
+                # BF16 (post the BF16-storage patch), aliasing inps & fp_outs.
+                # That broke layer_idx >= 1 because the per-expert loop's
+                # `layer(inps[s:e])` then read the just-written fp_outs (= this
+                # layer's output) instead of the layer's actual input. clone()
+                # forces a fresh buffer; fp_outs is overwritten in place by the
+                # next layer's `[s:e] = layer(...)` so we keep using it as the
+                # output staging area.
+                inps = full_precision_outs.clone()
 
         elif metric == "model_out_norm":
             # inps: [num_samples, seqlen]
@@ -624,7 +728,7 @@ class MoeModelQuantizer:
                     full_precision_outs[i] = self.ori_model.model(inps[i:i+1,:]).last_hidden_state.to(torch.float64)
 
             # 2. get the model output of with quantized layer
-            for layer_idx in tqdm(range(len(layers)), desc="Getting quantized output"):
+            for layer_idx in tqdm(range(num_layers_to_run), desc="Getting quantized output"):
                 num_layer_experts = len(get_expert_linears(self.ori_model, layer_idx, exclude_non_moe_layer=False))
                 for exp_id in tqdm(range(num_layer_experts), leave=False, desc="Quantizing Expert"):
                     qlayer_cfgs = enumerate_expert_qconfig(moe_bits_alloc, self.num_layers, num_layer_experts, exp_id, granularity)
@@ -728,7 +832,17 @@ if __name__ == "__main__":
     parser_calib.add_argument("--gran", type=str, choices=["expert", "linear"], default="linear", help="Granularity of estimation")
     parser_calib.add_argument("--online_had", action="store_true", help="Whether to use use Hadamard transform")
     parser_calib.add_argument("--nsamples", type=int, default=128, help="Number of samples for calibration")
+    parser_calib.add_argument("--gptq-nsamples", type=int, default=256,
+                              help="Number of samples for online GPTQ Hessian calibration.")
     parser_calib.add_argument("--seed", type=int, default=42, help="Random Seed.")
+    parser_calib.add_argument("--batch-size", type=int, default=32,
+                              help="Forward batch size for per-layer calib loops. "
+                                   "Smaller value (e.g. 16) for 24GB GPUs (rtx3090).")
+    parser_calib.add_argument("--n-gpus", type=int, default=1,
+                              help="If >=2 and online GPTQ/GPTQ-HAD is active, split layer "
+                                   "ranges across N CUDA devices.")
+    parser_calib.add_argument("--max-layers", type=int, default=None,
+                              help="Optional smoke-test cap on the number of layers to calibrate.")
 
     args = parser.parse_args(
         # [
@@ -846,6 +960,13 @@ if __name__ == "__main__":
         else:
             qmodel = model
 
+        # Patched: the `get_device_map={"": "cpu"}` patch in moe_utils keeps
+        # the model on CPU after load_hf_model (intended for calib's per-
+        # layer GPU swap). Eval forwards `flash_attn` which is CUDA-only, so
+        # move the (already-quantized) qmodel to cuda:0 here. qwen2_moe
+        # (~28GB BF16) and ds2 (~31GB BF16) fit on a 48GB ada GPU.
+        qmodel = qmodel.to(torch.device('cuda:0'))
+
         evaluator = Evaluator(tokenizer, model_id)
         eval_res = {}
 
@@ -923,21 +1044,26 @@ if __name__ == "__main__":
         logger.info(f">>> Metric: `{metric}`, Granularity: `{args.gran}`")
 
         if quant_type == "rtn":
-            model_quantizer = MoeModelQuantizer(model, model_id, QMethod.WxAy_NAIVE)
+            model_quantizer = MoeModelQuantizer(model, model_id, QMethod.WxAy_NAIVE, batch_size=args.batch_size)
             save_path = f"{CUR_DIR}/calib/{model_id}-MOE-rtn-{uni_qconfig}-{'wiki2'}-{nsamples}-{seqlen}-{metric}.json"
         elif quant_type == "gptq":
             assert uni_qconfig.a_bits == 16
             pre_quantized_weight = args.qweight
-            model_quantizer = MoeModelQuantizer(model, model_id, QMethod.GPTQ, pre_quantized_weight=pre_quantized_weight)
+            model_quantizer = MoeModelQuantizer(model, model_id, QMethod.GPTQ, pre_quantized_weight=pre_quantized_weight, batch_size=args.batch_size, gptq_nsamples=args.gptq_nsamples)
             save_path = f"{CUR_DIR}/calib/{model_id}-MOE-gptq-{uni_qconfig}-{'wiki2'}-{nsamples}-{seqlen}-{metric}.json"
         elif quant_type == "gptq-had":
             pre_quantized_weight = args.qweight
-            model_quantizer = MoeModelQuantizer(model, model_id, QMethod.GPTQ_HAD, pre_quantized_weight=pre_quantized_weight, online_had=args.online_had)
+            model_quantizer = MoeModelQuantizer(model, model_id, QMethod.GPTQ_HAD, pre_quantized_weight=pre_quantized_weight, online_had=args.online_had, batch_size=args.batch_size, gptq_nsamples=args.gptq_nsamples)
             save_path = f"{CUR_DIR}/calib/{model_id}-MOE-gptq-had-{uni_qconfig}-{'wiki2'}-{nsamples}-{seqlen}-{metric}.json"
         elif quant_type == "smooth":
             raise NotImplementedError("")
         else:
             raise ValueError(f"Unknown quantization type: {quant_type}")
+
+        # Plumb the layer-parallel selector. n_gpus == 1 keeps the single-GPU
+        # path; n_gpus >= 2 uses layer-owned workers for online GPTQ/GPTQ-HAD.
+        model_quantizer.n_gpus = args.n_gpus
+        model_quantizer.max_layers = args.max_layers
 
         model_quant_loss = model_quantizer.get_model_quant_error(
             trainloader, metric,

@@ -1,5 +1,6 @@
 # Adapted from https://github.com/IST-DASLab/gptq
 import math
+import os
 import time
 
 import torch
@@ -179,7 +180,53 @@ class GPTQ:
     def fasterquant(
         self, blocksize=128, percdamp=.01, groupsize=-1, actorder=False, static_groups=False
     ):
-        # [N, K]
+        # Backend dispatch. Default 'triton' goes through the CUDA-Graph-wrapped
+        # Triton kernel (mxmoe.quant.gptq_triton); 'legacy' keeps the original
+        # PyTorch inner loop below. The triton path is only used in the
+        # supported regime; otherwise we fall through to legacy without
+        # consuming self.H (the PyTorch body below needs it).
+        #   Supported by triton wrapper:
+        #     - any (groupsize) with static_groups=True
+        #     - groupsize=-1 or actorder=False (with static_groups=False)
+        #   Falls through to legacy:
+        #     - actorder=True + static_groups=False (no perm-aware dynamic find_params)
+        #     - self.quantizer.mse=True (wrapper does only minmax, no grid)
+        #     - self.quantizer.maxq < 0 (trits / ternary; kernel does only
+        #       uniform clamp(round, 0, maxq), not the {xmin, 0, xmax} mapping)
+        _backend = getattr(
+            self,
+            'triton_backend',
+            os.environ.get('MXMOE_GPTQ_TRITON_BACKEND', 'triton'),
+        )
+        _mse = bool(getattr(self.quantizer, 'mse', False))
+        _trits = bool(self.quantizer.maxq.item() < 0)
+        if (_backend in ('triton', 'triton_graph', 'triton_nograph')
+                and (static_groups or not actorder)
+                and not _mse and not _trits):
+            import math
+            if _backend == 'triton_nograph':
+                from mxmoe.quant.gptq_triton import (
+                    fasterquant_triton as _kernel_fn,
+                )
+            else:
+                from mxmoe.quant.gptq_triton import (
+                    fasterquant_triton_graph as _kernel_fn,
+                )
+            wbits = int(math.log2(self.quantizer.maxq.item() + 1))
+            sym = bool(getattr(self.quantizer, 'sym', False))
+            Q = _kernel_fn(
+                self.layer.weight.data, self.H,
+                wbits=wbits, groupsize=groupsize,
+                actorder=actorder, static_groups=static_groups, sym=sym,
+                blocksize=blocksize, percdamp=percdamp,
+            )
+            del self.H
+            self.layer.weight.data = Q.reshape(self.layer.weight.shape).to(
+                self.layer.weight.data.dtype
+            )
+            return
+
+        # [N, K]  (legacy PyTorch inner loop)
         W = self.layer.weight.data.clone()
         W = W.float()
 
@@ -317,7 +364,8 @@ def llama_sequential(args, model, dataloader, dev):
     inps = torch.zeros(
         (args.nsamples, seqlen, model.config.hidden_size), dtype=dtype, device=dev
     )
-    cache = {'i': 0, 'attention_mask': None}
+    cache = {'i': 0, 'attention_mask': None, 'position_ids': None,
+             'position_embeddings': None}
 
     class Catcher(nn.Module):
         def __init__(self, module):
@@ -328,6 +376,10 @@ def llama_sequential(args, model, dataloader, dev):
             cache['i'] += 1
             cache['attention_mask'] = kwargs['attention_mask']
             cache['position_ids'] = kwargs['position_ids']
+            # transformers >= 4.43 passes (cos, sin) tuple as
+            # `position_embeddings` to each decoder layer. DS2's custom
+            # modeling_deepseek doesn't pass it — allow missing.
+            cache['position_embeddings'] = kwargs.get('position_embeddings')
             raise ValueError
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
@@ -348,6 +400,8 @@ def llama_sequential(args, model, dataloader, dev):
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
     position_ids = cache['position_ids']
+    position_embeddings = cache['position_embeddings']
+    _pe_kw = {} if position_embeddings is None else {'position_embeddings': position_embeddings}
 
     print('Ready.')
 
@@ -385,6 +439,9 @@ def llama_sequential(args, model, dataloader, dev):
                 gptq[name].quantizer.configure(
                     args.wbits, perchannel=True, sym=args.sym, mse=False
                 )
+                # Backend selection (default 'triton'; falls through to legacy
+                # PyTorch inner loop for configs the kernel doesn't support).
+                gptq[name].triton_backend = getattr(args, 'gptq_backend', 'triton')
 
             def add_batch(name):
                 def tmp(_, inp, out):
@@ -394,7 +451,7 @@ def llama_sequential(args, model, dataloader, dev):
             for name in subset:
                 handles.append(subset[name].register_forward_hook(add_batch(name)))
             for j in range(args.nsamples):
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids, **_pe_kw)[0]
             for h in handles:
                 h.remove()
 
@@ -407,7 +464,7 @@ def llama_sequential(args, model, dataloader, dev):
                 gptq[name].free()
 
         for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids, **_pe_kw)[0]
 
         if "cpu" in ori_dev.type:
             layer = layers[i].to(ori_dev)
@@ -489,6 +546,16 @@ def gptq_param_parser():
     parser.add_argument(
         '--online-had', action='store_true',
         help='enable online hadamard rotation.'
+    )
+    parser.add_argument(
+        '--gptq-backend', type=str, default='triton',
+        choices=['legacy', 'triton'],
+        help='GPTQ inner-loop backend. "triton" uses the CUDA-Graph-wrapped '
+             'Triton kernel in mxmoe.quant.gptq_triton (default; ~2-3x '
+             'end-to-end speedup on qwen2_moe pre-quant, PPL preserved '
+             'within hardware noise for w≥3). "legacy" keeps the original '
+             'PyTorch inner loop. Unsupported configs (actorder+dynamic '
+             'groups, mse=True) automatically fall through to legacy.'
     )
 
     return parser
