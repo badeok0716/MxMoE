@@ -1,0 +1,44 @@
+[project]
+name = "mxmoe"
+version = "0.1.0"
+description = "Accuracy-Performance Co-design Framework for Mixed-Precision MoE Quantization"
+requires-python = "==3.11.*"
+# B200-only deps. The gateway/root pyproject.toml stays unchanged; b200_setup.sh
+# copies this file to the B200 checkout as pyproject.toml before uv sync.
+dependencies = [
+    # B200/Blackwell needs PyTorch wheels with sm_100 support. Use the PyTorch
+    # cu128 index instead of the repo default torch==2.6.0 PyPI cu124 wheel.
+    "torch>=2.7,<2.8",
+    "transformers==4.52.3",
+    "accelerate==1.7.0",
+    "datasets==3.6.0",
+    "numpy==2.2.6",
+    "pandas==2.2.3",
+    "einops==0.8.1",
+    "gurobipy==12.0.2",
+    "jsbeautifier==1.15.4",
+    "lm-eval==0.4.5",
+    "matplotlib==3.10.3",
+    "seaborn==0.13.2",
+    "tqdm==4.67.1",
+    "pyyaml==6.0.2",
+    "ninja==1.11.1.4",
+    "packaging>=24.0",
+    "setuptools>=80",
+    "wheel>=0.45",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mxmoe"]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }

@@ -44,7 +44,7 @@ git remote set-url b200 https://github.com/badeok0716/MxMoE.git
 Commit explicit files only, then push the branch/commit you want B200 to run:
 
 ```bash
-git add .gitignore CLAUDE.md pyproject.toml uv.lock project_config.py \
+git add .gitignore CLAUDE.md project_config.py \
     mxmoe/quant/gptq.py mxmoe/quant/gptq_triton.py \
     mxmoe/quant/layer_parallel_calib.py mxmoe/quant/parallel_calib.py \
     mxmoe/quant/moe_utils.py \
@@ -57,12 +57,20 @@ SHA=$(git rev-parse HEAD)
 
 No `gh pr`, no pull request.
 
+Do not edit the gateway/root `pyproject.toml` for B200. B200-specific package
+changes live in `pyproject_b200.toml` under this experiment directory only.
+
 ## Phase 1: Bootstrap B200
 
 This stages `b200_setup.sh` with sftp, then submits it as a B200 job. It clones
 `https://github.com/badeok0716/MxMoE.git` to `$B200_ROOT/MxMoE`, checks out the
-given SHA, builds the uv env, installs `flash-attn` and
+given SHA, copies this experiment's `pyproject_b200.toml` to the B200 checkout
+as `pyproject.toml`, builds the uv env, installs `flash-attn` and
 `fast-hadamard-transform`, and downloads `Qwen/Qwen2-57B-A14B-Instruct`.
+
+The B200-only pyproject switches PyTorch to the cu128 PyTorch index and selects
+a CUDA 12.8 toolkit before building CUDA extensions. This is intentionally
+confined to the B200 checkout; the gateway/root environment remains unchanged.
 
 ```bash
 bash exps/b200_exp_20260521_qwen2_moe_57b_remain/gateway_bootstrap.sh "$SHA"
@@ -134,5 +142,6 @@ b200_calib_one.sh          runs on B200; one qconfig calibration
 gateway_bootstrap.sh       runs on gateway; uploads/submits setup
 gateway_submit_remaining.sh runs on gateway; submits five qconfig jobs
 gateway_pull.sh            runs on gateway; pulls logs/results back
+pyproject_b200.toml        B200-only uv project; copied on B200 during setup
 run_b200_big_calib.py      exp-local qwen2_moe_57b calibration runner
 ```
