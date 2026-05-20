@@ -8,7 +8,7 @@ requires-python = "==3.11.*"
 dependencies = [
     # B200/Blackwell needs PyTorch wheels with sm_100 support. Use the PyTorch
     # cu128 index instead of the repo default torch==2.6.0 PyPI cu124 wheel.
-    "torch>=2.7,<2.8",
+    "torch==2.7.1",
     "transformers==4.52.3",
     "accelerate==1.7.0",
     "datasets==3.6.0",

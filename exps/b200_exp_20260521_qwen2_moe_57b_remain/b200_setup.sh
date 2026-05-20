@@ -78,6 +78,8 @@ export PATH="$CUDA_HOME/bin:$PATH"
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
 export MAX_JOBS="${MAX_JOBS:-16}"
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-10.0}"
+export UV_LINK_MODE="${UV_LINK_MODE:-copy}"
+export FLASH_ATTENTION_FORCE_BUILD="${FLASH_ATTENTION_FORCE_BUILD:-TRUE}"
 
 LOG=$B200_ROOT/mxmoe_qwen57b_setup_$(date +%Y%m%d_%H%M%S).log
 exec > >(tee -a "$LOG") 2>&1
@@ -127,10 +129,18 @@ uv sync --inexact
 uv run python - <<'PY'
 import torch
 print("torch after sync", torch.__version__, "cuda", torch.version.cuda)
+assert torch.__version__.startswith("2.7.1"), torch.__version__
 assert torch.version.cuda == "12.8", torch.version.cuda
 PY
 
-uv pip install --force-reinstall flash-attn==2.7.4.post1 --no-build-isolation
+uv pip uninstall flash-attn fast-hadamard-transform || true
+uv pip install --force-reinstall --no-deps --no-build-isolation --no-binary flash-attn flash-attn==2.7.4.post1
+uv run python - <<'PY'
+import torch
+print("torch after flash-attn install", torch.__version__, "cuda", torch.version.cuda)
+assert torch.__version__.startswith("2.7.1"), torch.__version__
+assert torch.version.cuda == "12.8", torch.version.cuda
+PY
 git submodule update --init --recursive mxmoe/3rdparty/fast-hadamard-transform
 rm -rf mxmoe/3rdparty/fast-hadamard-transform/build
 python - <<'PY'
@@ -156,7 +166,13 @@ if old not in text:
 path.write_text(text.replace(old, new))
 print("patched fast_hadamard_transform setup.py for sm_100-only B200 build")
 PY
-uv pip install --force-reinstall -e mxmoe/3rdparty/fast-hadamard-transform --no-build-isolation
+uv pip install --force-reinstall --no-deps -e mxmoe/3rdparty/fast-hadamard-transform --no-build-isolation
+uv run python - <<'PY'
+import torch
+print("torch after fast-hadamard install", torch.__version__, "cuda", torch.version.cuda)
+assert torch.__version__.startswith("2.7.1"), torch.__version__
+assert torch.version.cuda == "12.8", torch.version.cuda
+PY
 
 uv run python - <<'PY'
 import torch

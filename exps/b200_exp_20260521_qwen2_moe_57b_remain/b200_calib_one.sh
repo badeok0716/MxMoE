@@ -118,6 +118,8 @@ import torch
 import flash_attn
 import fast_hadamard_transform
 print("torch", torch.__version__, "cuda", torch.version.cuda)
+assert torch.__version__.startswith("2.7.1"), torch.__version__
+assert torch.version.cuda == "12.8", torch.version.cuda
 print("cuda devices", torch.cuda.device_count())
 print("flash_attn ok", flash_attn.__version__)
 print("fast_hadamard_transform ok")
